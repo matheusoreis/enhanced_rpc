@@ -1,0 +1,12 @@
+.godot/
+*.import
+export/
+build/
+*.tmp
+*.log
+*.cache
+.vscode/
+.idea/
+**/.DS_Store
+**/Thumbs.db
+*.uid
