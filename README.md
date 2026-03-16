@@ -1,6 +1,6 @@
 # EnhancedRpc
 
-Uma camada RPC para Godot 4 que te dá controle total sobre a serialização dos dados. Em vez de depender do sistema automático do Godot, você escreve e lê os argumentos diretamente em bytes — sem overhead, sem surpresas.
+Uma camada RPC para Godot 4 construída sobre ENet. Em vez de depender do sistema automático do Godot, você passa os argumentos diretamente como um `Array` — simples, sem overhead e sem surpresas.
 
 ## Como funciona
 
@@ -9,7 +9,7 @@ O sistema tem dois tipos de chamada:
 - **`exec`** — envia uma chamada e não espera resposta
 - **`invoke`** — envia uma chamada e aguarda um retorno com `await`
 
-Em ambos os casos, você usa um `StreamPeerBuffer` para escrever os dados que quer enviar (`put_float`, `put_u32`, `put_string`...) e o método registrado no outro lado recebe esse mesmo buffer para ler (`get_float`, `get_u32`, `get_string`...).
+Em ambos os casos, você passa os argumentos como um `Array`. O método registrado no outro lado os recebe como parâmetros normais da função.
 
 ## Instalação
 
@@ -39,12 +39,10 @@ func _ready() -> void:
     server.start(peer)
 
     # Registre os métodos que o cliente pode chamar
-    server.register_methods("game", [
-        func mover(ctx: RpcContext, buf: StreamPeerBuffer) -> void:
-            var x := buf.get_float()
-            var y := buf.get_float()
-            # faz algo com x e y...
-    ])
+    server.register_methods("game", [mover])
+
+func mover(x: float, y: float) -> void:
+    print("Peer %d quer mover para (%.1f, %.1f)" % [server.get_sender_id(), x, y])
 
 func _process(_delta: float) -> void:
     server.poll()
@@ -68,13 +66,10 @@ func _process(_delta: float) -> void:
 
 ### exec — sem retorno
 
-Passe o caminho `"escopo.metodo"` e uma função que escreve os argumentos no buffer:
+Passe o caminho `"escopo.metodo"` e um `Array` com os argumentos:
 
 ```gdscript
-client.exec("game.mover", func(buf: StreamPeerBuffer) -> void:
-    buf.put_float(x)
-    buf.put_float(y)
-)
+client.exec("game.mover", [x, y])
 ```
 
 Se o método não tiver argumentos, o segundo parâmetro é opcional:
@@ -85,65 +80,62 @@ client.exec("game.ping")
 
 ### invoke — com retorno
 
-Funciona igual ao `exec`, mas retorna um `StreamPeerBuffer` com os dados da resposta:
+Funciona igual ao `exec`, mas retorna a `Variant` devolvida pelo método remoto:
 
 ```gdscript
-var buf: StreamPeerBuffer = await client.invoke(
-    "game.get_hp",
-    func(b: StreamPeerBuffer) -> void:
-        b.put_u32(player_id)
-)
-var hp := buf.get_u16()
+var hp: int = await client.invoke("game.get_hp", [player_id])
 ```
 
-O método registrado no servidor precisa retornar um `StreamPeerBuffer`:
+O método registrado no servidor só precisa ter um `return` normal:
 
 ```gdscript
-server.register_methods("game", [
-    func get_hp(ctx: RpcContext, buf: StreamPeerBuffer) -> StreamPeerBuffer:
-        var player_id := buf.get_u32()
-        var out := StreamPeerBuffer.new()
-        out.put_u16(jogadores[player_id].hp)
-        return out,
-])
+server.register_methods("game", [get_hp])
+
+func get_hp(player_id: int) -> int:
+    return jogadores[player_id].hp
 ```
 
-## RpcContext
+## Obtendo o remetente
 
-Todo método registrado no servidor recebe um `RpcContext` como primeiro argumento. Por ele você acessa o `sender_id` — o peer id de quem fez a chamada:
+Para saber qual peer fez a chamada, use `get_sender_id()` dentro do método registrado:
 
 ```gdscript
-func atacar(ctx: RpcContext, buf: StreamPeerBuffer) -> void:
-    print("Peer %d atacou!" % ctx.sender_id)
+func atacar(alvo_id: int) -> void:
+    print("Peer %d atacou o peer %d!" % [server.get_sender_id(), alvo_id])
 ```
 
 ## Broadcast
 
-O servidor pode enviar para mais de um peer ao mesmo tempo. O packet é serializado **uma única vez** independente de quantos peers receberem.
+O servidor pode enviar para mais de um peer ao mesmo tempo. O pacote é serializado **uma única vez** independente de quantos peers receberem.
 
 ```gdscript
 # Peer específico
-server.exec(peer_id, "game.spawn", func(buf): buf.put_u32(entidade_id))
+server.exec(peer_id, "game.spawn", [entidade_id])
 
 # Lista de peers
-server.exec([peer_a, peer_b], "game.spawn", func(buf): buf.put_u32(entidade_id))
+server.exec([peer_a, peer_b], "game.spawn", [entidade_id])
 
 # Filtrado por uma condição
 server.exec(
     func(id: int) -> bool: return time[id] == Time.AZUL,
     "game.spawn",
-    func(buf): buf.put_u32(entidade_id)
+    [entidade_id]
 )
+
+# Broadcast para todos
+server.exec(null, "game.spawn", [entidade_id])
 ```
 
 ## Registrando métodos
 
 ```gdscript
-server.register_methods("escopo", [func nome_do_metodo(...), ...])
-server.unregister_methods("escopo", [func nome_do_metodo(...), ...])
+server.register_methods("escopo", [nome_do_metodo])
+server.unregister_methods("escopo", [nome_do_metodo])
 ```
 
 O nome do escopo e o nome da função formam juntos o identificador da chamada (`"escopo.metodo"`). Por isso **lambdas não são permitidas** — elas não têm nome estável.
+
+Os tipos dos parâmetros da função são validados automaticamente. Se os tipos não baterem com os argumentos recebidos, a chamada é ignorada.
 
 ## Referência da API
 
@@ -153,9 +145,12 @@ O nome do escopo e o nome da função formam juntos o identificador da chamada (
 |--------|-----------|
 | `start(peer)` | Inicia o cliente com o peer fornecido |
 | `stop()` | Encerra a conexão |
-| `poll(timeout_ms?)` | Processa os packets recebidos — chame no `_process` |
-| `exec(path, writer?, channel?)` | Envia uma chamada sem aguardar retorno |
-| `invoke(path, writer?, channel?)` | Envia uma chamada e aguarda retorno com `await` |
+| `poll(timeout_ms?)` | Processa os pacotes recebidos — chame no `_process` |
+| `exec(path, args?, channel?)` | Envia uma chamada sem aguardar retorno |
+| `invoke(path, args?, channel?)` | Envia uma chamada e aguarda retorno com `await` |
+| `get_sender_id()` | Retorna o peer id do remetente do pacote em processamento |
+| `register_methods(scope, callables)` | Registra métodos que podem ser chamados remotamente |
+| `unregister_methods(scope, callables)` | Remove métodos registrados |
 
 ### EnhancedServer
 
@@ -163,9 +158,10 @@ O nome do escopo e o nome da função formam juntos o identificador da chamada (
 |--------|-----------|
 | `start(peer)` | Inicia o servidor com o peer fornecido |
 | `stop()` | Encerra o servidor |
-| `poll(timeout_ms?)` | Processa os packets recebidos — chame no `_process` |
-| `exec(target, path, writer?, channel?)` | Envia para um peer, lista ou filtro |
-| `invoke(peer_id, path, writer?, channel?)` | Envia para um peer e aguarda retorno |
+| `poll(timeout_ms?)` | Processa os pacotes recebidos — chame no `_process` |
+| `exec(target, path, args?, channel?)` | Envia para um peer, lista ou filtro |
+| `invoke(peer_id, path, args?, channel?)` | Envia para um peer e aguarda retorno |
+| `get_sender_id()` | Retorna o peer id do remetente do pacote em processamento |
 | `register_methods(scope, callables)` | Registra métodos que podem ser chamados remotamente |
 | `unregister_methods(scope, callables)` | Remove métodos registrados |
 

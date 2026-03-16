@@ -1,19 +1,41 @@
+## Implementação do cliente para o sistema RPC (ERPC).
+##
+## Gerencia a conexão do cliente e permite enviar e receber
+## chamadas RPC de/para o servidor.
+##
+## [b]Exemplo:[/b]
+## [codeblock]
+## var client = EnhancedClient.new()
+## client.start(peer)
+## client.register_methods("Cliente", [self.receber_mensagem])
+## client.exec("Servidor.log", ["Olá do cliente!"])
+## [/codeblock]
 extends EnhancedRpc
 class_name EnhancedClient
 
+
+## Emitido quando ocorre um erro de rede.
 signal network_error()
+## Emitido quando a conexão com o servidor é estabelecida.
 signal connected()
+## Emitido quando a conexão com o servidor é encerrada.
 signal disconnected()
 
+
+## Instância interna do MultiplayerPeer.
 var multiplayer_peer: MultiplayerPeer = null
 
 
+## Inicializa o cliente com o peer fornecido.
+## [br]
+## [b]peer[/b]: Instância de [MultiplayerPeer] já configurada.
 func start(peer: MultiplayerPeer) -> void:
 	multiplayer_peer = peer
 	multiplayer_peer.peer_connected.connect(_on_connected)
 	multiplayer_peer.peer_disconnected.connect(_on_disconnected)
 
 
+## Encerra a conexão com o servidor.
 func stop() -> void:
 	if not multiplayer_peer:
 		return
@@ -22,6 +44,9 @@ func stop() -> void:
 	abort_all_tasks()
 
 
+## Processa eventos de rede. Deve ser chamado a cada frame.
+## [br]
+## [b]timeout_ms[/b]: Tempo máximo em milissegundos para processar eventos (padrão: 0).
 func poll(timeout_ms: int = 0) -> void:
 	if not multiplayer_peer:
 		return
@@ -31,48 +56,38 @@ func poll(timeout_ms: int = 0) -> void:
 		_poll_events()
 
 
-## Envia uma chamada sem retorno.
-## [writer] é um Callable que recebe um StreamPeerBuffer e escreve os argumentos.
-## Exemplo:
-##   client.exec("game.move", func(buf): buf.put_float(x); buf.put_float(y))
-func exec(function_path: StringName, writer: Callable = Callable(), channel_id: int = 0) -> void:
-	var buf := StreamPeerBuffer.new()
-	buf.put_u8(MessageType.EXEC)
-	buf.put_u32(function_path.hash())
-	if writer.is_valid():
-		writer.call(buf)
-	_send_raw(1, buf.data_array, channel_id)
+## Executa um método remoto no servidor sem aguardar retorno.
+## [br]
+## [b]function_path[/b]: Caminho completo do método (ex.: "Escopo.metodo").
+## [b]args[/b]: Argumentos a passar para o método.
+## [b]channel_id[/b]: Canal de rede.
+func exec(function_path: StringName, args: Array = [], channel_id: int = 0) -> void:
+	_send_raw(1, var_to_bytes([MessageType.EXEC, function_path.hash(), args]), channel_id)
 
 
-## Envia uma chamada e aguarda retorno.
-## [writer] escreve os argumentos no buffer de envio.
-## Retorna um StreamPeerBuffer posicionado no início do payload de resposta.
-## Exemplo:
-##   var buf = await client.invoke("game.get_state", func(buf): buf.put_u32(player_id))
-##   var hp = buf.get_u16()
-func invoke(function_path: StringName, writer: Callable = Callable(), channel_id: int = 0) -> StreamPeerBuffer:
+## Invoca um método remoto no servidor e aguarda o retorno.
+## [br]
+## [b]function_path[/b]: Caminho completo do método (ex.: "Escopo.metodo").
+## [b]args[/b]: Argumentos a passar para o método.
+## [b]channel_id[/b]: Canal de rede.
+func invoke(function_path: StringName, args: Array = [], channel_id: int = 0) -> Variant:
 	var task_id: int = _reserve_task_slot()
 	if task_id == -1:
-		push_error("[EnhancedClient] Task pool limit reached.")
+		push_error("[EnhancedClient] Limite do pool de tasks atingido.")
 		return null
 
 	var task_instance: PendingTask = PendingTask.new()
 	_task_pool[task_id] = task_instance
 
-	var buf := StreamPeerBuffer.new()
-	buf.put_u8(MessageType.INVOKE)
-	buf.put_u32(function_path.hash())
-	buf.put_u16(task_id)
-	if writer.is_valid():
-		writer.call(buf)
-	_send_raw(1, buf.data_array, channel_id)
+	_send_raw(1, var_to_bytes([MessageType.INVOKE, function_path.hash(), args, task_id]), channel_id)
 
-	var result_buf: StreamPeerBuffer = await task_instance.completed
+	var result: Variant = await task_instance.completed
 	_release_task_slot(task_id)
 
-	return result_buf
+	return result
 
 
+## [b]Interno:[/b] Implementação ENet para envio de dados brutos.
 func _send_raw(_peer_id: int, data_buffer: PackedByteArray, channel_id: int) -> void:
 	if multiplayer_peer:
 		multiplayer_peer.set_target_peer(1)
@@ -80,6 +95,7 @@ func _send_raw(_peer_id: int, data_buffer: PackedByteArray, channel_id: int) -> 
 		multiplayer_peer.put_packet(data_buffer)
 
 
+## [b]Interno:[/b] Verifica e processa novos eventos de rede.
 func _poll_events() -> void:
 	if not multiplayer_peer:
 		return
@@ -88,15 +104,17 @@ func _poll_events() -> void:
 		var packet_peer := multiplayer_peer.get_packet_peer()
 		var packet_channel := multiplayer_peer.get_packet_channel()
 		var packet := multiplayer_peer.get_packet()
-		process_packet(packet_peer, packet, packet_channel, false)
+		process_packet(packet_peer, packet, packet_channel)
 
 
+## [b]Interno:[/b] Callback de conexão com o servidor.
 func _on_connected(peer_id: int) -> void:
 	if peer_id != 1:
 		return
 	connected.emit()
 
 
+## [b]Interno:[/b] Callback de desconexão do servidor.
 func _on_disconnected(peer_id: int) -> void:
 	if peer_id != 1:
 		return
